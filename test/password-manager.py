@@ -43,4 +43,3 @@ class PasswordManager:
             for line in f:
                 username, password_hash = line.strip().split(':')
                 self.passwords[username] = password_hash
-           
