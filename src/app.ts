@@ -113,7 +113,7 @@ async function handlePullRequestOpened({
 //@ts-ignore
 reviewApp.webhooks.on("pull_request.opened", handlePullRequestOpened);
 
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 3001;
 const reviewWebhook = `/api/review`;
 
 const reviewMiddleware = createNodeMiddleware(reviewApp.webhooks, {
