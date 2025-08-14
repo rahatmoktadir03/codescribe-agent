@@ -7,6 +7,8 @@ import { Review } from "./constants";
 import { env } from "./env";
 import { processPullRequest } from "./review-agent";
 import { applyReview } from "./reviews";
+import { logger } from "./utils/logger";
+import { config } from "./utils/config";
 
 // This creates a new instance of the Octokit App class.
 const reviewApp = new App({
@@ -19,6 +21,11 @@ const reviewApp = new App({
 
 const getChangesPerFile = async (payload: WebhookEventMap["pull_request"]) => {
   try {
+    logger.debug("Fetching changed files for PR", {
+      repo: payload.repository.full_name,
+      pr: payload.pull_request.number,
+    });
+
     const octokit = await reviewApp.getInstallationOctokit(
       payload.installation.id
     );
@@ -27,10 +34,18 @@ const getChangesPerFile = async (payload: WebhookEventMap["pull_request"]) => {
       repo: payload.repository.name,
       pull_number: payload.pull_request.number,
     });
-    console.dir({ files }, { depth: null });
+
+    logger.info(
+      `Found ${files.length} changed files in PR #${payload.pull_request.number}`
+    );
+    logger.debug(
+      "Changed files:",
+      files.map((f) => f.filename)
+    );
+
     return files;
-  } catch (exc) {
-    console.log("exc");
+  } catch (error) {
+    logger.error("Failed to fetch changed files:", error);
     return [];
   }
 };
@@ -43,28 +58,54 @@ async function handlePullRequestOpened({
   octokit: Octokit;
   payload: WebhookEventMap["pull_request"];
 }) {
-  console.log(
-    `Received a pull request event for #${payload.pull_request.number}`
-  );
-  // const reposWithInlineEnabled = new Set<number>([601904706, 701925328]);
-  // const canInlineSuggest = reposWithInlineEnabled.has(payload.repository.id);
+  const prNumber = payload.pull_request.number;
+  const repoFullName = payload.repository.full_name;
+
+  logger.info(`🔍 Processing PR #${prNumber} in ${repoFullName}`);
+
+  const cfg = config.get();
+
   try {
-    console.log("pr info", {
+    logger.debug("Repository info:", {
       id: payload.repository.id,
       fullName: payload.repository.full_name,
       url: payload.repository.html_url,
     });
+
     const files = await getChangesPerFile(payload);
+
+    if (files.length === 0) {
+      logger.warn(`No files found for PR #${prNumber}, skipping review`);
+      return;
+    }
+
+    if (files.length > cfg.maxFilesPerReview) {
+      logger.warn(
+        `PR #${prNumber} has ${files.length} files, which exceeds the limit of ${cfg.maxFilesPerReview}. Some files may not be reviewed.`
+      );
+    }
+
+    logger.info(
+      `🚀 Starting ${
+        cfg.enableAgenticReview ? "agentic" : "traditional"
+      } review process...`
+    );
+
     const review: Review = await processPullRequest(
       octokit,
       payload,
       files,
       true
     );
-    await applyReview({ octokit, payload, review });
-    console.log("Review Submitted");
-  } catch (exc) {
-    console.log(exc);
+
+    if (review.review) {
+      await applyReview({ octokit, payload, review });
+      logger.success(`✅ Review completed and posted for PR #${prNumber}`);
+    } else {
+      logger.warn(`No review generated for PR #${prNumber}`);
+    }
+  } catch (error) {
+    logger.error(`❌ Failed to process PR #${prNumber}:`, error);
   }
 }
 
@@ -90,6 +131,12 @@ const server = http.createServer((req, res) => {
 
 // This creates a Node.js server that listens for incoming HTTP requests (including webhook payloads from GitHub) on the specified port. When the server receives a request, it executes the `middleware` function that you defined earlier. Once the server is running, it logs messages to the console to indicate that it is listening.
 server.listen(port, () => {
-  console.log(`Server is listening for events.`);
-  console.log("Press Ctrl + C to quit.");
+  logger.success(`🚀 CodeScribe Agent is running on port ${port}`);
+  logger.info(`📡 Webhook endpoint: http://localhost:${port}${reviewWebhook}`);
+  logger.info(
+    `🤖 Agentic review: ${
+      config.get().enableAgenticReview ? "ENABLED" : "DISABLED"
+    }`
+  );
+  logger.info("Press Ctrl + C to quit.");
 });

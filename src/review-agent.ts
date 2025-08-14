@@ -12,6 +12,7 @@ import type {
 } from "./constants";
 import { PRSuggestionImpl } from "./data/PRSuggestionImpl";
 import { generateChatCompletion } from "./llms/chat";
+import { ReviewAgent, AgentReviewResult } from "./llms/agent-chat";
 import {
   PR_SUGGESTION_TEMPLATE,
   buildPatchPrompt,
@@ -26,6 +27,8 @@ import {
   getInlineFixPrompt,
 } from "./prompts/inline-prompt";
 import { getGitFile } from "./reviews";
+import { logger } from "./utils/logger";
+import { config } from "./utils/config";
 
 export const reviewDiff = async (messages: ChatCompletionMessageParam[]) => {
   const message = await generateChatCompletion({
@@ -81,7 +84,9 @@ const filterFile = (file: PRFile) => {
   }
   const extension = splitFilename.pop()?.toLowerCase();
   if (extension && extensionsToIgnore.has(extension)) {
-    console.log(`Filtering out file with ignored extension: ${file.filename} (.${extension})`);
+    console.log(
+      `Filtering out file with ignored extension: ${file.filename} (.${extension})`
+    );
     return false;
   }
   return true;
@@ -507,6 +512,140 @@ const reviewChangesRetry = async (files: PRFile[], builders: Builders[]) => {
   throw new Error("All convoBuilders failed.");
 };
 
+/**
+ * Enhanced agentic review process that uses multiple specialized agents
+ */
+const performAgenticReview = async (
+  files: PRFile[],
+  owner: string,
+  repoName: string
+): Promise<BuilderResponse> => {
+  try {
+    logger.agent("Starting agentic review process...");
+
+    // Generate unified diff for all files
+    const patches = files.map((file) => buildPatchPrompt(file));
+    const unifiedDiff = patches.join("\n");
+
+    logger.debug(
+      `Generated unified diff with ${unifiedDiff.length} characters`
+    );
+
+    // Run comprehensive agent-based review
+    const agentResults = await ReviewAgent.comprehensiveReview(unifiedDiff);
+
+    // Combine all agent feedback into a cohesive review
+    let reviewComment = "## 🤖 AI-Powered Code Review\n\n";
+    reviewComment +=
+      "This pull request has been analyzed by multiple specialized AI agents. Here's what they found:\n\n";
+
+    const allSuggestions: any[] = [];
+
+    for (const result of agentResults) {
+      const emoji =
+        {
+          security: "🔒",
+          performance: "⚡",
+          code_quality: "✨",
+          documentation: "📝",
+          testing: "🧪",
+        }[result.type] || "🔍";
+
+      reviewComment += `### ${emoji} ${result.type
+        .replace("_", " ")
+        .toUpperCase()} Analysis\n`;
+      reviewComment += `${result.feedback}\n\n`;
+
+      if (result.suggestions.length > 0) {
+        reviewComment += "**Specific Issues Found:**\n";
+        result.suggestions.forEach((suggestion, index) => {
+          const severity = suggestion.severity || "medium";
+          const severityEmoji =
+            {
+              critical: "🚨",
+              high: "🔴",
+              medium: "🟡",
+              low: "🟢",
+            }[severity] || "🔍";
+
+          reviewComment += `${index + 1}. ${severityEmoji} **${
+            suggestion.file
+          }** `;
+          if (suggestion.line_start) {
+            reviewComment += `(Line ${suggestion.line_start}`;
+            if (
+              suggestion.line_end &&
+              suggestion.line_end !== suggestion.line_start
+            ) {
+              reviewComment += `-${suggestion.line_end}`;
+            }
+            reviewComment += `) `;
+          }
+          reviewComment += `- ${suggestion.issue}\n`;
+          reviewComment += `   *Suggested fix:* ${suggestion.suggestion}\n\n`;
+
+          // Convert to structured comment format for inline suggestions
+          allSuggestions.push(
+            new PRSuggestionImpl(
+              `${result.type}: ${suggestion.issue}`,
+              result.type,
+              suggestion.suggestion,
+              suggestion.suggestion, // Using suggestion as code for now
+              suggestion.file
+            )
+          );
+        });
+        reviewComment += "\n";
+      }
+    }
+
+    // Add summary
+    const totalIssues = agentResults.reduce(
+      (sum, result) => sum + result.suggestions.length,
+      0
+    );
+    const criticalIssues = agentResults.reduce(
+      (sum, result) =>
+        sum +
+        result.suggestions.filter((s) => s.severity === "critical").length,
+      0
+    );
+
+    reviewComment += "---\n\n";
+    reviewComment += `**Summary**: Found ${totalIssues} total issues`;
+    if (criticalIssues > 0) {
+      reviewComment += `, including ${criticalIssues} critical issues that should be addressed immediately`;
+    }
+    reviewComment += ".\n\n";
+    reviewComment +=
+      "This review was generated using multiple AI agents specializing in security, performance, code quality, documentation, and testing.";
+
+    const cfg = config.get();
+    if (reviewComment.length > cfg.maxCommentLength) {
+      logger.warn(
+        `Review comment truncated from ${reviewComment.length} to ${cfg.maxCommentLength} characters`
+      );
+      reviewComment =
+        reviewComment.substring(0, cfg.maxCommentLength - 100) +
+        "\n\n...(truncated)";
+    }
+
+    logger.success(`Generated agentic review with ${totalIssues} issues found`);
+
+    return {
+      comment: reviewComment,
+      structuredComments: allSuggestions,
+    };
+  } catch (error) {
+    logger.error("Error in agentic review:", error);
+    // Fallback to traditional review
+    return {
+      comment: "❌ Agentic review failed, falling back to standard review.",
+      structuredComments: [],
+    };
+  }
+};
+
 export const processPullRequest = async (
   octokit: Octokit,
   payload: WebhookEventMap["pull_request"],
@@ -517,7 +656,9 @@ export const processPullRequest = async (
   const filteredFiles = files.filter((file) => filterFile(file));
   console.dir({ filteredFiles }, { depth: null });
   if (filteredFiles.length == 0) {
-    console.log("Nothing to comment on, all files were filtered out. The PR Agent does not support the following file types: pdf, png, jpg, jpeg, gif, mp4, mp3, md, json, env, toml, svg, package-lock.json, yarn.lock, .gitignore, package.json, tsconfig.json, poetry.lock, readme.md");
+    console.log(
+      "Nothing to comment on, all files were filtered out. The PR Agent does not support the following file types: pdf, png, jpg, jpeg, gif, mp4, mp3, md, json, env, toml, svg, package-lock.json, yarn.lock, .gitignore, package.json, tsconfig.json, poetry.lock, readme.md"
+    );
     return {
       review: null,
       suggestions: [],
@@ -530,23 +671,21 @@ export const processPullRequest = async (
   );
   const owner = payload.repository.owner.login;
   const repoName = payload.repository.name;
-  const curriedXMLResponseBuilder = curriedXmlResponseBuilder(owner, repoName);
-  if (includeSuggestions) {
-    const reviewComments = await reviewChangesRetry(filteredFiles, [
-      {
-        convoBuilder: getXMLReviewPrompt,
-        responseBuilder: curriedXMLResponseBuilder,
-      },
-      {
-        convoBuilder: getReviewPrompt,
-        responseBuilder: basicResponseBuilder,
-      },
-    ]);
+
+  // Use agentic review as the primary method
+  try {
+    console.log("🚀 Attempting agentic review...");
+    const agenticReview = await performAgenticReview(
+      filteredFiles,
+      owner,
+      repoName
+    );
+
     let inlineComments: CodeSuggestion[] = [];
-    if (reviewComments.structuredComments.length > 0) {
-      console.log("STARTING INLINE COMMENT PROCESSING");
+    if (includeSuggestions && agenticReview.structuredComments.length > 0) {
+      console.log("STARTING AGENTIC INLINE COMMENT PROCESSING");
       inlineComments = await Promise.all(
-        reviewComments.structuredComments.map((suggestion) => {
+        agenticReview.structuredComments.map((suggestion) => {
           // find relevant file
           const file = files.find(
             (file) => file.filename === suggestion.filename
@@ -561,13 +700,24 @@ export const processPullRequest = async (
     const filteredInlineComments = inlineComments.filter(
       (comment) => comment !== null
     );
+
     return {
-      review: reviewComments,
+      review: agenticReview,
       suggestions: filteredInlineComments,
     };
-  } else {
-    const [review] = await Promise.all([
-      reviewChangesRetry(filteredFiles, [
+  } catch (error) {
+    console.error(
+      "❌ Agentic review failed, falling back to traditional review:",
+      error
+    );
+
+    // Fallback to traditional review
+    const curriedXMLResponseBuilder = curriedXmlResponseBuilder(
+      owner,
+      repoName
+    );
+    if (includeSuggestions) {
+      const reviewComments = await reviewChangesRetry(filteredFiles, [
         {
           convoBuilder: getXMLReviewPrompt,
           responseBuilder: curriedXMLResponseBuilder,
@@ -576,12 +726,48 @@ export const processPullRequest = async (
           convoBuilder: getReviewPrompt,
           responseBuilder: basicResponseBuilder,
         },
-      ]),
-    ]);
+      ]);
+      let inlineComments: CodeSuggestion[] = [];
+      if (reviewComments.structuredComments.length > 0) {
+        console.log("STARTING INLINE COMMENT PROCESSING");
+        inlineComments = await Promise.all(
+          reviewComments.structuredComments.map((suggestion) => {
+            // find relevant file
+            const file = files.find(
+              (file) => file.filename === suggestion.filename
+            );
+            if (file == null) {
+              return null;
+            }
+            return generateInlineComments(suggestion, file);
+          })
+        );
+      }
+      const filteredInlineComments = inlineComments.filter(
+        (comment) => comment !== null
+      );
+      return {
+        review: reviewComments,
+        suggestions: filteredInlineComments,
+      };
+    } else {
+      const [review] = await Promise.all([
+        reviewChangesRetry(filteredFiles, [
+          {
+            convoBuilder: getXMLReviewPrompt,
+            responseBuilder: curriedXMLResponseBuilder,
+          },
+          {
+            convoBuilder: getReviewPrompt,
+            responseBuilder: basicResponseBuilder,
+          },
+        ]),
+      ]);
 
-    return {
-      review,
-      suggestions: [],
-    };
+      return {
+        review,
+        suggestions: [],
+      };
+    }
   }
 };
