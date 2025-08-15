@@ -39,7 +39,7 @@ const DEFAULT_CONFIG: AgentConfig = {
   retryAttempts: 3,
 
   // Model settings
-  primaryModel: "mixtral-8x7b-32768",
+  primaryModel: "llama-3.1-70b-versatile",
   temperature: 0.1,
 
   // GitHub settings
